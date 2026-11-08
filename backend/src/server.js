@@ -6,6 +6,8 @@ const pool = require('./config/db');
 
 // Import authentication routes
 const authRoutes = require('./routes/authRoutes');
+const accountRoutes = require('./routes/accountRoutes');
+const transactionRoutes = require('./routes/transactionRoutes');
 
 const app = express();
 
@@ -14,6 +16,8 @@ app.use(express.json());
 
 // Register authentication routes
 app.use('/api/auth', authRoutes);
+app.use('/api/accounts', accountRoutes);
+app.use('/api/transactions', transactionRoutes);
 
 // Home API
 app.get('/', (req, res) => {
