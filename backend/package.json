@@ -9,8 +9,13 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "jest"
-},
+    "test": "jest --runInBand"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 30000,
+    "setupFiles": ["<rootDir>/tests/setupEnv.js"]
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
