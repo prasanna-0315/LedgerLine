@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ledgerline-api
+    runtime: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm install && npx prisma generate
+    startCommand: node src/server.js
+    healthCheckPath: /health
+    envVars:
+      - { key: NODE_ENV, value: production }
+      - { key: DATABASE_URL, sync: false }   # runtime role ledgerline_app (set in dashboard)
+      - { key: JWT_SECRET, generateValue: true }
+      - { key: REDIS_URL, sync: false }      # Upstash rediss:// URL
+      - { key: CORS_ORIGIN, sync: false }    # your Vercel URL, no trailing slash
