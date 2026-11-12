@@ -12,8 +12,9 @@ async function respond(res, operation) {
 
         if (result.status === 'REFUSED') {
             return res.status(422).json({
-                message: 'Transaction refused: insufficient funds',
+                message: `Transaction refused: ${result.reason === 'INSUFFICIENT_FUNDS' ? 'insufficient funds' : 'account not active'}`,
                 status: 'REFUSED',
+                reason: result.reason,
                 transactionId: result.transactionId
             });
         }
@@ -28,11 +29,6 @@ async function respond(res, operation) {
     } catch (error) {
         if (error instanceof ledger.LedgerError) {
             return res.status(error.status).json({ message: error.message });
-        }
-
-        // Two requests blocked each other in MySQL; the client can safely retry.
-        if (error.code === 'ER_LOCK_DEADLOCK') {
-            return res.status(409).json({ message: 'Conflict, please retry with the same Idempotency-Key' });
         }
 
         console.error(error);
@@ -56,3 +52,7 @@ exports.withdraw = (req, res) =>
 exports.transfer = (req, res) =>
     respond(res, () => ledger.transfer(
         req.user.id, req.body.fromAccountId, req.body.toAccountId, req.body.amount, keyOf(req)));
+
+// POST /api/transactions/:id/reverse   (ADMIN) compensating entries, never edits history
+exports.reverse = (req, res) =>
+    respond(res, () => ledger.reverse(req.user.id, req.params.id, keyOf(req)));

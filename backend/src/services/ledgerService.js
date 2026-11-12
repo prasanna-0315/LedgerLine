@@ -195,6 +195,7 @@ exports.transfer = (actorId, fromAccountId, toAccountId, amount, idempotencyKey)
 // transaction that moves the money back (compensating entries). A transaction can be reversed once
 // (partial unique index one_completed_reversal_per_tx) and a reversal itself cannot be reversed.
 exports.reverse = async (adminId, transactionId, idempotencyKey) => {
+    if (!/^\d{1,15}$/.test(String(transactionId))) throw new LedgerError(400, 'Invalid transaction id');
     const orig = await prisma.$queryRaw`
         SELECT id::text AS id, type::text AS type, status::text AS status, amount::text AS amount,
                from_account_id, to_account_id

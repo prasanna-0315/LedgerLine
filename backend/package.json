@@ -12,7 +12,8 @@
     "test": "jest --runInBand",
     "prisma:generate": "prisma generate",
     "migrate:deploy": "prisma migrate deploy",
-    "build": "prisma generate"
+    "build": "prisma generate",
+    "bootstrap:admin": "node scripts/bootstrapAdmin.js"
   },
   "jest": {
     "testEnvironment": "node",
@@ -31,8 +32,11 @@
     "express": "^5.3.0",
     "express-validator": "^7.3.2",
     "jsonwebtoken": "^9.0.3",
-    "mysql2": "^3.24.6",
-    "@prisma/client": "^6.0.0"
+    "@prisma/client": "^6.0.0",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "express-rate-limit": "^7.5.0",
+    "rate-limit-redis": "^4.2.0"
   },
   "devDependencies": {
     "jest": "^30.5.2",
