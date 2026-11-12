@@ -6,8 +6,11 @@ const Redis = require('ioredis');
 let redis = null;
 if (process.env.REDIS_URL) {
     redis = new Redis(process.env.REDIS_URL, {
-        maxRetriesPerRequest: 1, enableOfflineQueue: false, lazyConnect: false
-    });
+    maxRetriesPerRequest: 1,
+    enableOfflineQueue: true,
+    lazyConnect: false,
+    retryStrategy: (times) => Math.min(times * 1000, 5000)
+});
     redis.on('error', (e) => console.error('Redis error:', e.code || e.message)); // never log the URL
 } else if (process.env.NODE_ENV === 'production') {
     console.error('WARNING: REDIS_URL not set: rate limiting is per-instance only');
