@@ -1,12 +1,8 @@
 const crypto = require('crypto');
-const pool = require('../config/db');
+const { Prisma } = require('@prisma/client');
+const prisma = require('../config/prisma');
 const { parseAmountToCents, decimalToCents, centsToString } = require('../utils/money');
 
-// Account id 1 is the bank's EXTERNAL_CASH account (created by the SQL file).
-// Deposits come FROM it, withdrawals go TO it. This keeps every transaction balanced.
-const SYSTEM_ACCOUNT_ID = 1;
-
-// An error that carries the HTTP status code we want to send back.
 class LedgerError extends Error {
     constructor(status, message) {
         super(message);
@@ -14,216 +10,212 @@ class LedgerError extends Error {
     }
 }
 
-// A fingerprint of WHAT the request asks for. Two requests with the same
-// fingerprint are "the same request". Amounts are compared in cents, so
-// "100" and "100.00" count as equal.
-function fingerprint(type, fromId, toId, cents) {
-    return crypto
-        .createHash('sha256')
-        .update(`${type}|${fromId}|${toId}|${cents}`)
+const MAX_ATTEMPTS = 6;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// PostgreSQL asks us to retry when two SERIALIZABLE transactions conflict (40001)
+// or when it breaks a deadlock (40P01). Nothing was committed, so retrying is safe.
+function isRetryable(error) {
+    return error?.code === 'P2034' ||
+        ['40001', '40P01'].includes(error?.meta?.code) ||
+        /could not serialize|deadlock detected/i.test(error?.message || '');
+}
+
+// A fingerprint of WHAT the request asks for. Same key + same fingerprint = same request.
+// Amounts are compared in cents, so "100" and "100.00" are equal.
+function fingerprint(type, fromId, toId, cents, reverses) {
+    return crypto.createHash('sha256')
+        .update(`${type}|${fromId}|${toId}|${cents}|${reverses ?? ''}`)
         .digest('hex');
 }
 
+async function getSystemAccountId(tx) {
+    const rows = await tx.$queryRaw`SELECT id FROM accounts WHERE is_system = true`;
+    if (rows.length !== 1) throw new Error('System account missing: run the database migrations');
+    return rows[0].id;
+}
+
 /*
- * moveMoney: the ONE function that changes balances.
- * Deposit, withdrawal and transfer are all "move money from account A to account B".
- *
- *   type           - 'DEPOSIT' | 'WITHDRAWAL' | 'TRANSFER'
- *   fromId         - account that is debited
- *   toId           - account that is credited
- *   amount         - what the user sent (validated here again)
- *   actorId        - id of the logged-in user
- *   mustOwnId      - the customer account the actor must own
- *   idempotencyKey - unique key sent by the client for this request
+ * postEntry: the ONE place balances change. Runs inside an already-open transaction.
+ * Moves `cents` from account `from` (DEBIT) to account `to` (CREDIT) and writes the
+ * transaction row + exactly one DEBIT and one CREDIT ledger entry.
  */
-async function moveMoney({ type, fromId, toId, amount, actorId, mustOwnId, idempotencyKey }) {
-    const cents = parseAmountToCents(amount);
-    if (cents === null) {
-        throw new LedgerError(400, 'Invalid amount');
-    }
-    if (type === 'TRANSFER' && fromId === toId) {
-        throw new LedgerError(400, 'Cannot transfer to the same account');
-    }
-
-    const requestHash = fingerprint(type, fromId, toId, cents);
-
-    try {
-        return await executeOnce({
-            type, fromId, toId, cents, actorId, mustOwnId, idempotencyKey, requestHash
-        });
-
-    } catch (error) {
-        // The unique (user_id, idempotency_key) index rejected our INSERT:
-        // this key was already used. Do NOT move money again.
-        if (error.code === 'ER_DUP_ENTRY') {
-            return await replayPreviousResult(actorId, idempotencyKey, requestHash);
-        }
-        throw error;
-    }
-}
-
-// Duplicate request: look up the original answer and return it.
-async function replayPreviousResult(actorId, idempotencyKey, requestHash) {
-    // Fresh read (outside the rolled-back transaction) so we see the committed row.
-    const [rows] = await pool.query(
-        `SELECT request_hash, response_json
-           FROM idempotency_keys
-          WHERE user_id = ? AND idempotency_key = ?`,
-        [actorId, idempotencyKey]
-    );
-
-    if (rows.length === 0 || rows[0].response_json === null) {
-        throw new LedgerError(409, 'Request is still being processed. Please retry.');
-    }
-
-    // Same key but a DIFFERENT request: reject, it is either a bug or an attack.
-    if (rows[0].request_hash !== requestHash) {
-        throw new LedgerError(409, 'Idempotency key was already used with a different request');
-    }
-
-    const original = typeof rows[0].response_json === 'string'
-        ? JSON.parse(rows[0].response_json)
-        : rows[0].response_json;
-
-    return { ...original, replayed: true };
-}
-
-// The real work. Runs inside ONE database transaction.
-async function executeOnce({ type, fromId, toId, cents, actorId, mustOwnId, idempotencyKey, requestHash }) {
+async function postEntry(tx, { type, from, to, cents, actorId, reverses = null }) {
     const amountText = centsToString(cents);
-    const connection = await pool.getConnection();
+    const fromBalance = decimalToCents(from.balance);
+    const toBalance = decimalToCents(to.balance);
 
-    try {
-        // Everything below succeeds together or not at all.
-        await connection.beginTransaction();
+    const refuse = async (reason) => {
+        const rows = await tx.$queryRaw`
+            INSERT INTO transactions (type, status, amount, from_account_id, to_account_id, initiated_by, refusal_reason, reverses_transaction_id)
+            VALUES (${type}::"TxType", 'REFUSED', ${amountText}::numeric, ${from.id}, ${to.id}, ${actorId}, ${reason}, ${reverses})
+            RETURNING id::text AS id`;
+        return { status: 'REFUSED', reason, transactionId: Number(rows[0].id) };
+    };
 
-        // STEP 1: claim the idempotency key.
-        // If the key already exists, MySQL throws ER_DUP_ENTRY and we stop.
-        // If another request with the same key is still running, this INSERT
-        // WAITS until that request commits, so two parallel copies can never both run.
-        await connection.query(
-            `INSERT INTO idempotency_keys (user_id, idempotency_key, request_hash)
-             VALUES (?, ?, ?)`,
-            [actorId, idempotencyKey, requestHash]
-        );
+    // Frozen / closed accounts cannot move money.
+    if ((!from.is_system && from.status !== 'ACTIVE') || (!to.is_system && to.status !== 'ACTIVE')) {
+        return refuse('ACCOUNT_NOT_ACTIVE');
+    }
+    // NO OVERDRAFT. (The system account is "cash in the world" and may go negative.)
+    if (!from.is_system && fromBalance < cents) {
+        return refuse('INSUFFICIENT_FUNDS');
+    }
 
-        // STEP 2: LOCK both accounts, always lowest id first. Two transfers going in
-        // opposite directions therefore lock in the same order and cannot deadlock.
-        const [rows] = await connection.query(
-            `SELECT id, owner_id, balance, is_system
-               FROM accounts
-              WHERE id IN (?, ?)
-              ORDER BY id
-              FOR UPDATE`,
-            [fromId, toId]
-        );
+    const newFrom = fromBalance - cents;
+    const newTo = toBalance + cents;
 
-        const from = rows.find(r => r.id === fromId);
-        const to = rows.find(r => r.id === toId);
+    const created = await tx.$queryRaw`
+        INSERT INTO transactions (type, status, amount, from_account_id, to_account_id, initiated_by, reverses_transaction_id)
+        VALUES (${type}::"TxType", 'COMPLETED', ${amountText}::numeric, ${from.id}, ${to.id}, ${actorId}, ${reverses})
+        RETURNING id::text AS id`;
+    const transactionId = created[0].id; // text -> bound back as bigint below
 
-        if (!from || !to) {
-            throw new LedgerError(404, 'Account not found');
+    await tx.$executeRaw`UPDATE accounts SET balance = ${centsToString(newFrom)}::numeric WHERE id = ${from.id}`;
+    await tx.$executeRaw`UPDATE accounts SET balance = ${centsToString(newTo)}::numeric WHERE id = ${to.id}`;
+
+    // DOUBLE ENTRY: one DEBIT and one CREDIT of the same amount (the database re-checks this at COMMIT).
+    await tx.$executeRaw`
+        INSERT INTO ledger_entries (transaction_id, account_id, entry_type, amount, balance_after)
+        VALUES (${transactionId}::bigint, ${from.id}, 'DEBIT',  ${amountText}::numeric, ${centsToString(newFrom)}::numeric),
+               (${transactionId}::bigint, ${to.id},   'CREDIT', ${amountText}::numeric, ${centsToString(newTo)}::numeric)`;
+
+    return {
+        status: 'COMPLETED',
+        transactionId: Number(transactionId),
+        fromBalance: centsToString(newFrom),
+        toBalance: centsToString(newTo)
+    };
+}
+
+/*
+ * moveMoney: runs one money operation exactly once, atomically.
+ *   mustOwnId - the customer account the actor must own (null for admin reversals)
+ */
+async function moveMoney({ type, fromId, toId, amount, actorId, mustOwnId, idempotencyKey, reverses = null }) {
+    const cents = parseAmountToCents(amount);
+    if (cents === null) throw new LedgerError(400, 'Invalid amount');
+    if (fromId === toId) throw new LedgerError(400, 'Cannot use the same account on both sides');
+
+    const requestHash = fingerprint(type, fromId, toId, cents, reverses);
+
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await prisma.$transaction(
+                (tx) => executeOnce(tx, { type, fromId, toId, cents, actorId, mustOwnId, idempotencyKey, requestHash, reverses }),
+                { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, maxWait: 5000, timeout: 15000 }
+            );
+        } catch (error) {
+            if (isRetryable(error) && attempt < MAX_ATTEMPTS) {
+                await sleep(15 * 2 ** attempt + Math.random() * 25); // back off, then try again
+                continue;
+            }
+            if (isRetryable(error)) throw new LedgerError(409, 'Conflict, please retry with the same Idempotency-Key');
+            throw error;
         }
+    }
+}
 
-        // Customers can never use the system account as a transfer target.
-        if (type === 'TRANSFER' && (from.is_system || to.is_system)) {
-            throw new LedgerError(404, 'Account not found');
+async function executeOnce(tx, { type, fromId, toId, cents, actorId, mustOwnId, idempotencyKey, requestHash, reverses }) {
+    // STEP 1: claim the idempotency key. ON CONFLICT DO NOTHING + unique index means only ONE
+    // of several parallel identical requests gets the row; the others wait, then see the result.
+    const claimed = await tx.$queryRaw`
+        INSERT INTO idempotency_keys (user_id, idempotency_key, operation, request_hash)
+        VALUES (${actorId}, ${idempotencyKey}, ${type}, ${requestHash})
+        ON CONFLICT (user_id, idempotency_key) DO NOTHING
+        RETURNING id`;
+
+    if (claimed.length === 0) {
+        const existing = await tx.$queryRaw`
+            SELECT request_hash, response_json FROM idempotency_keys
+             WHERE user_id = ${actorId} AND idempotency_key = ${idempotencyKey}`;
+        if (existing.length === 0 || existing[0].response_json === null) {
+            throw new LedgerError(409, 'Request is still being processed. Please retry.');
         }
+        if (existing[0].request_hash !== requestHash) {
+            throw new LedgerError(409, 'Idempotency key was already used with a different request');
+        }
+        return { ...existing[0].response_json, replayed: true };
+    }
 
-        // AUTHORIZATION on the server: the actor must own the customer-side account.
-        const ownedAccount = mustOwnId === fromId ? from : to;
-        if (ownedAccount.is_system || ownedAccount.owner_id !== actorId) {
+    // STEP 2: LOCK both accounts, lowest id first (same order for everyone => no deadlock).
+    const rows = await tx.$queryRaw`
+        SELECT id, owner_id, balance::text AS balance, is_system, status::text AS status
+          FROM accounts
+         WHERE id IN (${Prisma.join([fromId, toId])})
+         ORDER BY id
+         FOR UPDATE`;
+    const from = rows.find(r => r.id === fromId);
+    const to = rows.find(r => r.id === toId);
+    if (!from || !to) throw new LedgerError(404, 'Account not found');
+
+    if (type === 'TRANSFER' && (from.is_system || to.is_system)) {
+        throw new LedgerError(404, 'Account not found');
+    }
+
+    // STEP 3: AUTHORIZATION on the server: the actor must own the customer-side account.
+    if (mustOwnId !== null) {
+        const owned = mustOwnId === fromId ? from : to;
+        if (owned.is_system || owned.owner_id !== actorId) {
             throw new LedgerError(403, 'You do not have access to this account');
         }
-
-        const fromBalance = decimalToCents(from.balance);
-        const toBalance = decimalToCents(to.balance);
-
-        // NO OVERDRAFT: refuse if the debited account does not have enough.
-        // (The system account is allowed to go negative: it represents "cash in the world".)
-        if (!from.is_system && fromBalance < cents) {
-            const [refused] = await connection.query(
-                `INSERT INTO transactions
-                   (type, status, amount, from_account_id, to_account_id, initiated_by, refusal_reason)
-                 VALUES (?, 'REFUSED', ?, ?, ?, ?, 'INSUFFICIENT_FUNDS')`,
-                [type, amountText, fromId, toId, actorId]
-            );
-
-            const result = { status: 'REFUSED', transactionId: refused.insertId };
-            await saveResponse(connection, actorId, idempotencyKey, result);
-            await connection.commit(); // refused attempt is kept; no balance changed
-            return result;
-        }
-
-        const newFromBalance = fromBalance - cents;
-        const newToBalance = toBalance + cents;
-
-        const [created] = await connection.query(
-            `INSERT INTO transactions
-               (type, status, amount, from_account_id, to_account_id, initiated_by)
-             VALUES (?, 'COMPLETED', ?, ?, ?, ?)`,
-            [type, amountText, fromId, toId, actorId]
-        );
-        const transactionId = created.insertId;
-
-        await connection.query('UPDATE accounts SET balance = ? WHERE id = ?',
-            [centsToString(newFromBalance), fromId]);
-        await connection.query('UPDATE accounts SET balance = ? WHERE id = ?',
-            [centsToString(newToBalance), toId]);
-
-        // DOUBLE ENTRY: one DEBIT and one CREDIT of the same amount.
-        await connection.query(
-            `INSERT INTO ledger_entries
-               (transaction_id, account_id, entry_type, amount, balance_after)
-             VALUES (?, ?, 'DEBIT',  ?, ?),
-                    (?, ?, 'CREDIT', ?, ?)`,
-            [
-                transactionId, fromId, amountText, centsToString(newFromBalance),
-                transactionId, toId,   amountText, centsToString(newToBalance)
-            ]
-        );
-
-        // Only return the balance of the account the actor owns (never the other party's).
-        const myNewBalance = mustOwnId === fromId ? newFromBalance : newToBalance;
-        const result = {
-            status: 'COMPLETED',
-            transactionId,
-            balance: centsToString(myNewBalance)
-        };
-
-        // Save the answer in the SAME transaction as the money movement,
-        // so "money moved" and "answer remembered" can never get out of sync.
-        await saveResponse(connection, actorId, idempotencyKey, result);
-        await connection.commit();
-        return result;
-
-    } catch (error) {
-        await connection.rollback(); // undo everything if anything went wrong
-        throw error;
-    } finally {
-        connection.release();
     }
-}
 
-async function saveResponse(connection, actorId, idempotencyKey, result) {
-    await connection.query(
-        `UPDATE idempotency_keys
-            SET response_json = ?
-          WHERE user_id = ? AND idempotency_key = ?`,
-        [JSON.stringify(result), actorId, idempotencyKey]
-    );
+    // STEP 4: move the money, then remember the answer — all in this same transaction.
+    const posted = await postEntry(tx, { type, from, to, cents, actorId, reverses });
+
+    const result = { status: posted.status, transactionId: posted.transactionId };
+    if (posted.status === 'REFUSED') result.reason = posted.reason;
+    if (mustOwnId !== null && posted.status === 'COMPLETED') {
+        result.balance = mustOwnId === fromId ? posted.fromBalance : posted.toBalance;
+    }
+
+    await tx.$executeRaw`
+        UPDATE idempotency_keys SET response_json = ${JSON.stringify(result)}::jsonb
+         WHERE user_id = ${actorId} AND idempotency_key = ${idempotencyKey}`;
+    return result;
 }
 
 exports.LedgerError = LedgerError;
 
-exports.deposit = (actorId, accountId, amount, idempotencyKey) =>
-    moveMoney({ type: 'DEPOSIT', fromId: SYSTEM_ACCOUNT_ID, toId: accountId,
-                amount, actorId, mustOwnId: accountId, idempotencyKey });
+exports.deposit = async (actorId, accountId, amount, idempotencyKey) => {
+    const systemId = await prisma.$transaction(getSystemAccountId);
+    return moveMoney({ type: 'DEPOSIT', fromId: systemId, toId: accountId, amount, actorId, mustOwnId: accountId, idempotencyKey });
+};
 
-exports.withdraw = (actorId, accountId, amount, idempotencyKey) =>
-    moveMoney({ type: 'WITHDRAWAL', fromId: accountId, toId: SYSTEM_ACCOUNT_ID,
-                amount, actorId, mustOwnId: accountId, idempotencyKey });
+exports.withdraw = async (actorId, accountId, amount, idempotencyKey) => {
+    const systemId = await prisma.$transaction(getSystemAccountId);
+    return moveMoney({ type: 'WITHDRAWAL', fromId: accountId, toId: systemId, amount, actorId, mustOwnId: accountId, idempotencyKey });
+};
 
 exports.transfer = (actorId, fromAccountId, toAccountId, amount, idempotencyKey) =>
-    moveMoney({ type: 'TRANSFER', fromId: fromAccountId, toId: toAccountId,
-                amount, actorId, mustOwnId: fromAccountId, idempotencyKey });
+    moveMoney({ type: 'TRANSFER', fromId: fromAccountId, toId: toAccountId, amount, actorId, mustOwnId: fromAccountId, idempotencyKey });
+
+// ADMIN ONLY (enforced by the route). History is never edited: a mistake is corrected by a NEW
+// transaction that moves the money back (compensating entries). A transaction can be reversed once
+// (partial unique index one_completed_reversal_per_tx) and a reversal itself cannot be reversed.
+exports.reverse = async (adminId, transactionId, idempotencyKey) => {
+    const orig = await prisma.$queryRaw`
+        SELECT id::text AS id, type::text AS type, status::text AS status, amount::text AS amount,
+               from_account_id, to_account_id
+          FROM transactions WHERE id = ${transactionId}::bigint`;
+    if (orig.length === 0) throw new LedgerError(404, 'Transaction not found');
+    const t = orig[0];
+    if (t.status !== 'COMPLETED') throw new LedgerError(422, 'Only completed transactions can be reversed');
+    if (t.type === 'REVERSAL') throw new LedgerError(422, 'A reversal cannot be reversed');
+
+    try {
+        return await moveMoney({
+            type: 'REVERSAL', fromId: t.to_account_id, toId: t.from_account_id, amount: t.amount,
+            actorId: adminId, mustOwnId: null, idempotencyKey, reverses: BigInt(t.id)
+        });
+    } catch (error) {
+        // Unique index on reverses_transaction_id: someone already reversed it.
+        if (error?.code === 'P2010' && error?.meta?.code === '23505' || /one_completed_reversal_per_tx|reverses_transaction_id/.test(error?.message || '')) {
+            throw new LedgerError(409, 'Transaction was already reversed');
+        }
+        throw error;
+    }
+};
+
+exports._internals = { isRetryable, fingerprint };

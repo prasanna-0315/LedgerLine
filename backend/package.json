@@ -9,12 +9,17 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "prisma:generate": "prisma generate",
+    "migrate:deploy": "prisma migrate deploy",
+    "build": "prisma generate"
   },
   "jest": {
     "testEnvironment": "node",
     "testTimeout": 30000,
-    "setupFiles": ["<rootDir>/tests/setupEnv.js"]
+    "setupFiles": [
+      "<rootDir>/tests/setupEnv.js"
+    ]
   },
   "keywords": [],
   "author": "",
@@ -26,11 +31,13 @@
     "express": "^5.3.0",
     "express-validator": "^7.3.2",
     "jsonwebtoken": "^9.0.3",
-    "mysql2": "^3.24.6"
+    "mysql2": "^3.24.6",
+    "@prisma/client": "^6.0.0"
   },
   "devDependencies": {
     "jest": "^30.5.2",
     "nodemon": "^3.1.14",
-    "supertest": "^7.3.1"
+    "supertest": "^7.3.1",
+    "prisma": "^6.0.0"
   }
 }

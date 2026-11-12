@@ -1,0 +1,155 @@
+// LedgerLine database schema (PostgreSQL).
+// Money is NUMERIC(15,2). The application does its arithmetic in integer cents
+// (see src/utils/money.js) and never uses JavaScript floating point for money.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  ACCOUNT_HOLDER
+  AUDITOR
+}
+
+enum AccountStatus {
+  ACTIVE
+  FROZEN
+  CLOSED
+}
+
+enum TxType {
+  DEPOSIT
+  WITHDRAWAL
+  TRANSFER
+  REVERSAL
+}
+
+enum TxStatus {
+  COMPLETED
+  REFUSED
+}
+
+enum EntryType {
+  DEBIT
+  CREDIT
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String   @db.VarChar(100)
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(100)
+  role         Role     @default(ACCOUNT_HOLDER)
+  isActive     Boolean  @default(true) @map("is_active")
+  // Bumping this number invalidates every JWT issued earlier (logout / role change).
+  tokenVersion Int      @default(0) @map("token_version")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  accounts         Account[]
+  transactions     Transaction[]
+  idempotencyKeys  IdempotencyKey[]
+  auditLogs        AuditLog[]
+
+  @@map("users")
+}
+
+model Account {
+  id          Int           @id @default(autoincrement())
+  ownerId     Int?          @map("owner_id") // NULL only for the system account
+  accountName String        @map("account_name") @db.VarChar(100)
+  balance     Decimal       @default(0) @db.Decimal(15, 2)
+  isSystem    Boolean       @default(false) @map("is_system")
+  status      AccountStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamp(3)
+
+  owner         User?         @relation(fields: [ownerId], references: [id])
+  debits        Transaction[] @relation("FromAccount")
+  credits       Transaction[] @relation("ToAccount")
+  ledgerEntries LedgerEntry[]
+
+  @@index([ownerId])
+  @@map("accounts")
+}
+
+model Transaction {
+  id                   BigInt   @id @default(autoincrement())
+  type                 TxType
+  status               TxStatus
+  amount               Decimal  @db.Decimal(15, 2)
+  fromAccountId        Int      @map("from_account_id")
+  toAccountId          Int      @map("to_account_id")
+  initiatedBy          Int      @map("initiated_by")
+  refusalReason        String?  @map("refusal_reason") @db.VarChar(255)
+  // Set only on REVERSAL rows. A partial UNIQUE index (see migration 2, COMPLETED rows only)
+  // makes sure a transaction is successfully reversed at most once.
+  reversesTransactionId BigInt? @map("reverses_transaction_id")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  fromAccount Account  @relation("FromAccount", fields: [fromAccountId], references: [id])
+  toAccount   Account  @relation("ToAccount", fields: [toAccountId], references: [id])
+  initiator   User     @relation(fields: [initiatedBy], references: [id])
+  reverses    Transaction?  @relation("Reversal", fields: [reversesTransactionId], references: [id])
+  reversedBy  Transaction[] @relation("Reversal")
+  entries     LedgerEntry[]
+
+  @@index([reversesTransactionId])
+  @@index([fromAccountId, id])
+  @@index([toAccountId, id])
+  @@index([initiatedBy, id])
+  @@map("transactions")
+}
+
+model LedgerEntry {
+  id            BigInt    @id @default(autoincrement())
+  transactionId BigInt    @map("transaction_id")
+  accountId     Int       @map("account_id")
+  entryType     EntryType @map("entry_type")
+  amount        Decimal   @db.Decimal(15, 2)
+  balanceAfter  Decimal   @map("balance_after") @db.Decimal(15, 2)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+  account     Account     @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, id])
+  @@index([transactionId])
+  @@map("ledger_entries")
+}
+
+model IdempotencyKey {
+  id             BigInt   @id @default(autoincrement())
+  userId         Int      @map("user_id")
+  idempotencyKey String   @map("idempotency_key") @db.VarChar(64)
+  operation      String   @db.VarChar(20)
+  requestHash    String   @map("request_hash") @db.Char(64)
+  responseJson   Json?    @map("response_json")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  // The database guarantees one row per (user, key), even under parallel requests.
+  @@unique([userId, idempotencyKey], map: "uq_user_key")
+  @@map("idempotency_keys")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    Int?     @map("actor_id")
+  action     String   @db.VarChar(60)
+  targetType String   @map("target_type") @db.VarChar(40)
+  targetId   String   @map("target_id") @db.VarChar(40)
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([actorId, id])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
